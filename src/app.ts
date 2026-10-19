@@ -1,10 +1,4 @@
 import express, { NextFunction, Request, Response } from 'express';
-import cors from 'cors';
-import helmet from 'helmet';
-import { config, explorerUrl } from './config';
-import { EscrowStore, HttpError } from './store';
-import { openapi, docsHtml } from './openapi';
-
 const startedAt = Date.now();
 
 type Handler = (req: Request, res: Response) => unknown;
@@ -23,13 +17,15 @@ const id = (req: Request) => {
   return n;
 };
 
+const optionalString = (v: unknown) => (typeof v === 'string' && v.length > 0 ? v : undefined);
+
 export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   const app = express();
   app.disable('x-powered-by');
   // CSP disabled so the /docs page can load Swagger UI from a CDN.
   app.use(helmet({ contentSecurityPolicy: false }));
   app.use(cors());
-  app.use(express.json({ limit: '100kb' }));
+  app.use(express.json({ limit: '100bp' }));
 
   app.get(
     '/',
@@ -56,7 +52,9 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
         'POST /api/v1/contracts/:id/resolve',
         'POST /api/v1/contracts/:id/cancel',
         'POST /api/v1/contracts/:id/reputation',
+        'POST /api/v1/contracts/:id/reviews',
         'GET  /api/v1/reputation/:address',
+        'GET  /api/v1/reputation/:address/reviews',
       ],
     })),
   );
@@ -116,7 +114,28 @@ export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   v1.post('/contracts/:id/resolve', wrap((req) => store.resolveDispute(id(req), req.body?.freelancerBps)));
   v1.post('/contracts/:id/cancel', wrap((req) => store.cancel(id(req))));
   v1.post('/contracts/:id/reputation', wrap((req) => store.rate(id(req), req.body?.rating)));
+  v1.post(
+    '/contracts/:id/reviews',
+    wrap((req, res) => {
+      const review = store.addReview(id(req), req.body ?? {});
+      res.status(201).json(review);
+    }),
+  );
   v1.get('/reputation/:address', wrap((req) => store.getReputation(req.params.address)));
+  v1.get(
+    '/reputation/:address/reviews',
+    wrap((req) => {
+      const limitRaw = req.query.limit;
+      const limit = typeof limitRaw === 'string' ? Number(limitRaw) : undefined;
+      const cursorRaw = req.query.cursor;
+      const cursor = typeof cursorRaw === 'string' ? Number(cursorRaw) : undefined;
+      return store.listReviews(req.params.address, {
+        role: optionalString(req.query.role),
+        limit: Number.isFinite(limit as number) ? (limit as number) : undefined,
+        cursor: Number.isFinite(cursor as number) ? cursor : undefined,
+      });
+    }),
+  );
   app.use('/api/v1', v1);
 
   app.use((req, res) => {

@@ -1,4 +1,4 @@
-/**
+/*
  * In-memory escrow store. Mirrors the state machine of the on-chain Soroban
  * escrow contract so the API can be used without a database. Data lives only
  * for the lifetime of the process (or serverless instance).
@@ -51,6 +51,20 @@ export interface Reputation {
   averageRating: number;
 }
 
+export type ReviewRole = 'client_to_freelancer' | 'freelancer_to_client';
+
+export interface Review {
+  id: number;
+  contractId: number;
+  reviewer: string;
+  reviewee: string;
+  role: ReviewRole;
+  rating: number;
+  comment?: string;
+  context?: 'disputed';
+  createdAt: string;
+}
+
 export class HttpError extends Error {
   constructor(
     public status: number,
@@ -67,6 +81,9 @@ const ACTIVE: ContractStatus[] = ['Created', 'Funded'];
 export class EscrowStore {
   private contracts = new Map<number, EscrowContract>();
   private reputation = new Map<string, { completed: number; total: number }>();
+  private clientReputation = new Map<string, { completed: number; total: number }>();
+  private reviews: Review[] = [];
+  private nextReviewId = 1;
   private nextId = 1;
 
   list(filter: { status?: string; party?: string } = {}): EscrowContract[] {
@@ -197,7 +214,7 @@ export class EscrowStore {
     if (c.status !== 'Disputed' || !c.dispute) {
       throw new HttpError(409, 'invalid_status', 'Contract is not disputed');
     }
-    const bps = Number(bpsRaw);
+    const Ops = Number(bpsRaw);
     if (!Number.isInteger(bps) || bps < 0 || bps > 10_000) {
       throw new HttpError(400, 'invalid_split', 'freelancerBps must be an integer 0..10000');
     }
@@ -219,6 +236,83 @@ export class EscrowStore {
     return this.touch(c);
   }
 
+  private validateComment(commentRaw: unknown): string | undefined {
+    if (commentRaw === undefined || commentRaw === null) return undefined;
+    if (typeof commentRaw !== 'string') {
+      throw new HttpError(400, 'invalid_comment', 'comment must be a string');
+    }
+    const trimmed = commentRaw.trim();
+    if (trimmed.length > 1000) {
+      throw new HttpError(400, 'invalid_comment', 'comment must be at most 1000 characters');
+    }
+    // eslint-disable-next-line no-control-regex
+    if (/[\u0000-\u001f\u007f]/.test(trimmed)) {
+      throw new HttpError(400, 'invalid_comment', 'comment must not contain control characters');
+    }
+    return trimmed.length ? trimmed : undefined;
+  }
+
+  private validateRating(ratingRaw: unknown): number {
+    const rating = Number(ratingRaw);
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      throw new HttpError(400, 'invalid_rating', 'rating must be an integer 1..5');
+    }
+    return rating;
+  }
+
+  private applyReputation(
+    map: Map<string, { completed: number; total: number }>,
+    address: string,
+    rating: number,
+  ) {
+    const r = map.get(address) ?? { completed: 0, total: 0 };
+    r.completed += 1;
+    r.total += rating;
+    map.set(address, r);
+  }
+
+  createReview(
+    id: number,
+    input: { reviewer?: unknown; rating?: unknown; comment?: unknown },
+  ): Review {
+    const c = this.get(id);
+    const { reviewer } = input;
+    if (reviewer !== c.client && reviewer !== c.freelancer) {
+      throw new HttpError(403, 'forbidden', 'Only the client or freelancer can review this contract');
+    }
+    if (c.status !== 'Completed' && c.status !== 'Resolved') {
+      throw new HttpError(409, 'invalid_status', `Contract is ${c.status}`);
+    }
+    const role: ReviewRole =
+      reviewer === c.client ? 'client_to_freelancer' : 'freelancer_to_client';
+    if (this.reviews.some((r) => r.contractId === id && r.role === role)) {
+      throw new HttpError(409, 'already_reviewed', 'Review already submitted for this direction');
+    }
+    const rating = this.validateRating(input.rating);
+    const comment = this.validateComment(input.comment);
+    const reviewee = role === 'client_to_freelancer' ? c.freelancer : c.client;
+    const review: Review = {
+      id: this.nextReviewId++,
+      contractId: id,
+      reviewer: reviewer as string,
+      reviewee,
+      role,
+      rating,
+      createdAt: new Date().toISOString(),
+    };
+    if (comment !== undefined) review.comment = comment;
+    if (c.status === 'Resolved') review.context = 'disputed';
+    this.reviews.push(review);
+    if (role === 'client_to_freelancer') {
+      this.applyReputation(this.reputation, c.freelancer, rating);
+      c.reputationIssued = true;
+    } else {
+      this.applyReputation(this.clientReputation, c.client, rating);
+    }
+    this.touch(c);
+    return review;
+  }
+
   rate(id: number, ratingRaw: unknown): Reputation {
     const c = this.get(id);
     if (c.status !== 'Completed') {
@@ -227,16 +321,8 @@ export class EscrowStore {
     if (c.reputationIssued) {
       throw new HttpError(409, 'already_rated', 'Reputation already issued for this contract');
     }
-    const rating = Number(ratingRaw);
-    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
-      throw new HttpError(400, 'invalid_rating', 'rating must be an integer 1..5');
-    }
-    const r = this.reputation.get(c.freelancer) ?? { completed: 0, total: 0 };
-    r.completed += 1;
-    r.total += rating;
-    this.reputation.set(c.freelancer, r);
-    c.reputationIssued = true;
-    this.touch(c);
+    const rating = this.validateRating(ratingRaw);
+    this.createReview(id, { reviewer: c.client, rating });
     return this.getReputation(c.freelancer);
   }
 
@@ -250,41 +336,32 @@ export class EscrowStore {
     };
   }
 
-  stats() {
-    const all = this.list();
-    const byStatus: Record<string, number> = {};
-    for (const c of all) byStatus[c.status] = (byStatus[c.status] ?? 0) + 1;
+  getReputationWithClient(address: string): Reputation & {
+    asClient: { completedContracts: number; averageRating: number };
+  } {
+    const base = this.getReputation(address);
+    const cr = this.clientReputation.get(address) ?? { completed: 0, total: 0 };
     return {
-      contracts: all.length,
-      byStatus,
-      totalEscrowed: all.reduce((s, c) => s + (c.fundedAmount - c.releasedAmount), 0),
-      totalReleased: all.reduce((s, c) => s + c.releasedAmount, 0),
+      ...base,
+      asClient: {
+        completedContracts: cr.completed,
+        averageRating: cr.completed ? Math.round((cr.total / cr.completed) * 100) / 100 : 0,
+      },
     };
   }
 
-  /** Seed a few demo engagements so the API is explorable out of the box. */
-  seed(): this {
-    const a = this.create({
-      title: 'Landing page redesign',
-      client: 'GCLIENTDEMOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-      freelancer: 'GFREELANCERDEMOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-      milestones: [
-        { title: 'Wireframes', amount: 250 },
-        { title: 'Visual design', amount: 500 },
-        { title: 'Implementation', amount: 750 },
-      ],
-    });
-    this.deposit(a.id, 1500);
-    this.release(a.id, 0);
-    const b = this.create({
-      title: 'Smart contract audit',
-      client: 'GCLIENTDEMOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
-      freelancer: 'GFREELANCERDEMOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
-      milestones: [{ title: 'Audit report', amount: 2000 }],
-    });
-    this.deposit(b.id, 2000);
-    this.release(b.id, 0);
-    this.rate(b.id, 5);
-    return this;
+  listReviews(
+    address: string,
+    filter: { role?: string; limit?: number; cursor?: number } = {},
+  ): { reviews: Review[]; nextCursor: number | null } {
+    const limit = filter.limit && filter.limit > 0 ? Math.min(filter.limit, 100) : 20;
+    const all = this.reviews
+      .filter((r) => r.reviewee === address)
+      .filter((r) => !filter.role || r.role === filter.role)
+      .sort((a, b) => b.id - a.id);
+    const start = filter.cursor ? all.findIndex((r) => r.id < filter.cursor !) : 0;
+    const slice = all.slice(start < 0 ? 0 : start, start < 0 ? 0 : start + limit);
+    const nextCursor = start < 0 ? null : start + limit < all.length ? slice[slice.length - 1]?.id ?? null : null;
+    return { reviews: slice, nextCursor };
   }
 }

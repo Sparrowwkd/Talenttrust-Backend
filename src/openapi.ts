@@ -6,6 +6,9 @@ const ok = (description: string, schema: object = { type: 'object' }) => ({
 });
 const idParam = { name: 'id', in: 'path', required: true, schema: { type: 'integer' } };
 const contractRef = { $ref: '#/components/schemas/EscrowContract' };
+const addressParam = { name: 'address', in: 'path', required: true, schema: { type: 'string' } };
+const reviewRef = { $ref: '#/components/schemas/Review' };
+const errorRef = { $ref: '#/components/schemas/Error' };
 
 export const openapi = {
   openapi: '3.0.3',
@@ -105,22 +108,121 @@ export const openapi = {
       post: {
         tags: ['Reputation'],
         summary: 'Rate the freelancer of a completed contract',
+        description:
+          'Backward-compatible endpoint. Creates a client-to-freelancer review without a comment ' +
+          'and sets the contract reputationIssued flag.',
         parameters: [idParam],
         requestBody: { content: json({ type: 'object', properties: { rating: { type: 'integer', minimum: 1, maximum: 5 } } }) },
-        responses: ok('Reputation'),
+        responses: {
+          ...ok('Reputation', { $ref: '#/components/schemas/Reputation' }),
+          400: { description: 'invalid_rating', content: json(errorRef) },
+          409: { description: 'already_rated or invalid_status', content: json(errorRef) },
+        },
+      },
+    },
+    '/api/v1/contracts/{id}/reviews': {
+      post: {
+        tags: ['Reputation'],
+        summary: 'Create a review for a contract (client or freelancer)',
+        description:
+          'One review per direction per contract. The reviewer must be a party to the contract, ' +
+          'the contract must be Completed or Resolved. Reviews of Resolved contracts carry ' +
+          "context: 'disputed'.",
+        parameters: [idParam],
+        requestBody: {
+          required: true,
+          content: json({
+            type: 'object',
+            required: ['reviewer', 'rating'],
+            properties: {
+              reviewer: { type: 'string', description: 'Client or freelancer address of the contract' },
+              rating: { type: 'integer', minimum: 1, maximum: 5 },
+              comment: { type: 'string', maxLength: 1000, description: 'Trimmed; control characters rejected' },
+            },
+          }),
+        },
+        responses: {
+          201: { description: 'Created', content: json(reviewRef) },
+          400: { description: 'invalid_rating or invalid_comment', content: json(errorRef) },
+          403: { description: 'forbidden', content: json(errorRef) },
+          404: { description: 'not_found', content: json(errorRef) },
+          409: { description: 'invalid_status or already_reviewed', content: json(errorRef) },
+        },
       },
     },
     '/api/v1/reputation/{address}': {
       get: {
         tags: ['Reputation'],
-        summary: 'Get freelancer reputation',
-        parameters: [{ name: 'address', in: 'path', required: true, schema: { type: 'string' } }],
-        responses: ok('Reputation'),
+        summary: 'Get reputation for an address (freelancer and client)',
+        parameters: [addressParam],
+        responses: ok('Reputation', { $ref: '#/components/schemas/Reputation' }),
+      },
+    },
+    '/api/v1/reputation/{address}/reviews': {
+      get: {
+        tags: ['Reputation'],
+        summary: 'List reviews received by an address, newest first',
+        parameters: [
+          addressParam,
+          {
+            name: 'role',
+            in: 'query',
+            required: false,
+            schema: { type: 'string', enum: ['client_to_freelancer', 'freelancer_to_client'] },
+            description: 'Filter by review direction',
+          },
+          { name: 'limit', in: 'query', required: false, schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 } },
+          { name: 'cursor', in: 'query', required: false, schema: { type: 'string' }, description: 'Opaque pagination cursor' },
+        ],
+        responses: ok('Reviews', {
+          type: 'object',
+          properties: {
+            reviews: { type: 'array', items: reviewRef },
+            nextCursor: { type: 'string', nullable: true },
+          },
+        }),
       },
     },
   },
   components: {
     schemas: {
+      Error: {
+        type: 'object',
+        properties: {
+          error: { type: 'string' },
+          message: { type: 'string' },
+        },
+      },
+      Review: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer' },
+          contractId: { type: 'integer' },
+          reviewer: { type: 'string' },
+          reviewee: { type: 'string' },
+          role: { type: 'string', enum: ['client_to_freelancer', 'freelancer_to_client'] },
+          rating: { type: 'integer', minimum: 1, maximum: 5 },
+          comment: { type: 'string', maxLength: 1000 },
+          context: { type: 'string', enum: ['disputed'], description: 'Present only for reviews of Resolved contracts' },
+          createdAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      Reputation: {
+        type: 'object',
+        properties: {
+          address: { type: 'string' },
+          completedContracts: { type: 'integer' },
+          totalRating: { type: 'integer' },
+          averageRating: { type: 'number' },
+          asClient: {
+            type: 'object',
+            properties: {
+              completedContracts: { type: 'integer' },
+              averageRating: { type: 'number' },
+            },
+          },
+        },
+      },
       EscrowContract: {
         type: 'object',
         properties: {
@@ -152,7 +254,7 @@ export const openapi = {
 };
 
 export const docsHtml = `<!doctype html>
-<html lang="en">
+  <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
