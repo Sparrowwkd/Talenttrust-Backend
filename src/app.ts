@@ -1,252 +1,142 @@
-/**
- * @module app
- * @description Express application factory.
- *
- * This factory is the single place where process-wide singletons are wired
- * into the HTTP stack, so it also owns the invariants that keep that state
- * consistent when the factory is called more than once and when the process
- * tears down:
- *
- * @invariant INV-1 — The metrics registry holds exactly one service per
- *   process. `createApp()` initialises it on first use and then reuses it.
- *   Re-creating it per call would leave routers bound to one instance while
- *   cache interceptors and other consumers of the global registry write to a
- *   different one, splitting every metric across two registries.
- *
- * @invariant INV-2 — The terminal 404/error pair is registered exactly once
- *   per application and is the last thing mounted. `notFoundHandler` ends the
- *   chain, so any layer mounted after it is silently unreachable.
- *
- * @invariant INV-3 — Every router is mounted on exactly one path. Routers that
- *   carry a rate limiter must not be mounted twice: a request that falls
- *   through the first mount would consume the limiter budget again on the
- *   second one.
- *
- * @invariant INV-4 — `shutdownRateLimitStore()` releases every rate-limit
- *   store this module owns exactly once and reports through the structured
- *   logger so teardown failures stay diagnosable.
- */
+import express, { NextFunction, Request, Response } from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import { config, explorerUrl } from './config';
+import { EscrowStore, HttpError } from './store';
+import { openapi, docsHtml } from './openapi';
 
-import express from 'express';
-import { applySecurityMiddleware } from './middleware/security';
-import { MetricsService } from './observability/metrics-service';
-import { setMetricsService } from './observability/registry';
-import { rateLimitStore, apiKeysRateLimitStore } from './config/rateLimit';
-import { notFoundHandler, errorHandler } from './middleware/errorHandlers';
-import { healthRouter as legacyHealthRouter } from './routes/health';
-import { healthRouter as readinessHealthRouter } from './health';
-import { validateEnv } from './config/env.schema';
-import { createRequestLimitsMiddleware } from './middleware/requestLimits';
-import apiKeysRouter from './routes/apiKeys.routes';
-import { createContractsRouter } from './routes/contracts.routes';
-import eventsRouter from './routes/events.routes';
-import { createDisputesRouter } from './routes/disputes.routes';
-import { createMetricsRouter } from './routes/metrics.routes';
-import { metricsAuthMiddleware } from './middleware/metricsAuth';
-import reputationRouter from './routes/reputation.routes';
-import authRouter from './routes/auth.routes';
-import configRouter from './routes/config.routes';
-import dependencyScanRouter from './routes/dependency-scan.routes';
-import { adminRouter } from './routes/admin.routes';
-import { deployRouter } from './routes/deploy.routes';
-import rpcEventsRouter from './routes/rpcEvents.routes';
-import { webhookSubscriptionRouter } from './routes/webhook-subscription.routes';
-import { features } from './config/features';
-import { requestIdMiddleware } from './middleware/requestId';
-import { httpLoggerMiddleware } from './middleware/httpLogger';
-import { ReputationService } from './services/reputation.service';
-import { getDb } from './db/database';
-import { requestContextMiddleware } from './context';
-import { logger } from './logger';
+const startedAt = Date.now();
 
-interface AppFactoryOptions {
-  includeTerminalHandlers?: boolean;
-}
-
-/** Applications that already have the terminal 404/error layers mounted (INV-2). */
-const terminalHandlerApps = new WeakSet<express.Application>();
-
-/**
- * Process-wide metrics service (INV-1). Stays `null` until the first
- * `createApp()` call initialises the global registry.
- */
-let metricsServiceInstance: MetricsService | null = null;
-
-/** Latches teardown so repeated shutdown signals report once (INV-4). */
-let rateLimitStoresReleased = false;
-
-type DestroyableStore = { destroy?: () => void };
-
-/**
- * Returns the process-wide metrics service, creating it on first use.
- *
- * The instance is created once and then reused, so every app instance and the
- * global registry share a single set of collectors (INV-1). The first
- * successful call wins; later calls ignore their own environment so repeated
- * factory calls cannot fork the registry.
- *
- * @param httpRouteLabelLimit - Resolved route-label cardinality limit
- * @returns The shared metrics service instance
- */
-function resolveMetricsService(httpRouteLabelLimit: number): MetricsService {
-  if (metricsServiceInstance === null) {
-    metricsServiceInstance = new MetricsService(
-      process.env['SERVICE_NAME'] ?? 'talenttrust-backend',
-      undefined,
-      { httpRouteLabelLimit },
-    );
-    setMetricsService(metricsServiceInstance);
+type Handler = (req: Request, res: Response) => unknown;
+const wrap = (fn: Handler) => (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const out = fn(req, res);
+    if (out !== undefined && !res.headersSent) res.json(out);
+  } catch (err) {
+    next(err);
   }
-  return metricsServiceInstance;
-}
+};
 
-/**
- * Mounts the terminal not-found and error handlers (INV-2).
- *
- * These layers terminate the Express chain, so they must be the last layers
- * mounted on the application. Callers that still need to mount routes after
- * the factory runs must build the app with `includeTerminalHandlers: false`
- * and call this afterwards.
- *
- * Re-entrant: a second call for the same application is a no-op, so the pair
- * is never mounted twice and cannot shadow handlers added after it.
- *
- * @param app - Application to seal
- */
-export function attachTerminalHandlers(app: express.Application): void {
-  if (terminalHandlerApps.has(app)) {
-    logger.warn('app_terminal_handlers_already_attached', {
-      hint: 'attachTerminalHandlers is idempotent; the extra call was ignored',
-    });
-    return;
-  }
-  terminalHandlerApps.add(app);
+const id = (req: Request) => {
+  const n = Number(req.params.id);
+  if (!Number.isInteger(n) || n < 1) throw new HttpError(400, 'invalid_id', 'id must be a positive integer');
+  return n;
+};
 
-  app.use(notFoundHandler);
-  app.use(errorHandler);
-}
-
-/**
- * Creates the Express application with all routes and middleware wired.
- *
- * @param options - Factory options. Omitting it is equivalent to passing
- *                an empty object.
- * @returns The configured Express application.
- */
-export function createApp(options?: AppFactoryOptions): express.Application {
-  const includeTerminalHandlers = options?.includeTerminalHandlers ?? true;
-  const env = validateEnv();
+export function createApp(store: EscrowStore = new EscrowStore().seed()) {
   const app = express();
+  app.disable('x-powered-by');
+  // CSP disabled so the /docs page can load Swagger UI from a CDN.
+  app.use(helmet({ contentSecurityPolicy: false }));
+  app.use(cors());
+  app.use(express.json({ limit: '100kb' }));
 
-  applySecurityMiddleware(app, env.CORS_ALLOWED_ORIGINS);
+  app.get(
+    '/',
+    wrap(() => ({
+      name: 'TalentTrust API',
+      version: config.version,
+      description: 'Milestone-based freelancer escrow API backed by a Soroban contract on Stellar.',
+      docs: '/docs',
+      openapi: '/openapi.json',
+      website: config.frontendUrl,
+      chain: { network: config.network, contractId: config.contractId, explorer: explorerUrl() },
+      endpoints: [
+        'GET  /health',
+        'GET  /docs',
+        'GET  /openapi.json',
+        'GET  /api/v1/chain',
+        'GET  /api/v1/stats',
+        'GET  /api/v1/contracts',
+        'POST /api/v1/contracts',
+        'GET  /api/v1/contracts/:id',
+        'POST /api/v1/contracts/:id/deposit',
+        'POST /api/v1/contracts/:id/milestones/:index/release',
+        'POST /api/v1/contracts/:id/dispute',
+        'POST /api/v1/contracts/:id/resolve',
+        'POST /api/v1/contracts/:id/cancel',
+        'POST /api/v1/contracts/:id/reputation',
+        'GET  /api/v1/reputation/:address',
+      ],
+    })),
+  );
 
-  const metricsService = resolveMetricsService(env.HTTP_METRICS_ROUTE_LABEL_LIMIT);
+  app.get(
+    '/health',
+    wrap(() => ({
+      status: 'ok',
+      version: config.version,
+      uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
+      storage: 'in-memory',
+      timestamp: new Date().toISOString(),
+    })),
+  );
 
-  app.use(requestIdMiddleware);
-  app.use(requestContextMiddleware);
-  app.use(createRequestLimitsMiddleware());
-  app.use(express.json());
-  app.use(httpLoggerMiddleware);
-  app.use(metricsService.trackHttpRequest.bind(metricsService));
-
-  const db = getDb();
-  // Fire-and-forget initialization is safe here because ensureReputationInitialized
-  // guarantees the underlying work runs at most once and concurrent callers share
-  // the same in-flight promise. Errors are surfaced through the returned promise
-  // and must not be swallowed silently.
-  void ensureReputationInitialized(db).catch((err) => {
-    console.error('[app] ReputationService initialization failed', err);
+  app.get('/openapi.json', wrap(() => openapi));
+  app.get(['/docs', '/docs/'], (_req, res) => {
+    res.type('html').send(docsHtml);
   });
 
-  app.get('/metrics', metricsAuthMiddleware, async (_req, res) => {
-    res.setHeader('Content-Type', metricsService.contentType);
-    res.status(200).send(await metricsService.getMetrics());
+  const v1 = express.Router();
+  v1.get(
+    '/chain',
+    wrap(() => ({
+      network: config.network,
+      rpcUrl: config.rpcUrl,
+      contractId: config.contractId,
+      explorer: explorerUrl(),
+    })),
+  );
+  v1.get('/stats', wrap(() => store.stats()));
+  v1.get(
+    '/contracts',
+    wrap((req) => ({
+      data: store.list({
+        status: typeof req.query.status === 'string' ? req.query.status : undefined,
+        party: typeof req.query.party === 'string' ? req.query.party : undefined,
+      }),
+    })),
+  );
+  v1.post(
+    '/contracts',
+    wrap((req, res) => {
+      res.status(201).json(store.create(req.body ?? {}));
+    }),
+  );
+  v1.get('/contracts/:id', wrap((req) => store.get(id(req))));
+  v1.post('/contracts/:id/deposit', wrap((req) => store.deposit(id(req), req.body?.amount)));
+  v1.post(
+    '/contracts/:id/milestones/:index/release',
+    wrap((req) => store.release(id(req), Number(req.params.index))),
+  );
+  v1.post(
+    '/contracts/:id/dispute',
+    wrap((req) => store.openDispute(id(req), req.body?.raisedBy, req.body?.reason)),
+  );
+  v1.post('/contracts/:id/resolve', wrap((req) => store.resolveDispute(id(req), req.body?.freelancerBps)));
+  v1.post('/contracts/:id/cancel', wrap((req) => store.cancel(id(req))));
+  v1.post('/contracts/:id/reputation', wrap((req) => store.rate(id(req), req.body?.rating)));
+  v1.get('/reputation/:address', wrap((req) => store.getReputation(req.params.address)));
+  app.use('/api/v1', v1);
+
+  app.use((req, res) => {
+    res.status(404).json({ error: 'not_found', message: `No route for ${req.method} ${req.path}`, docs: '/docs' });
   });
 
-  app.use('/health', legacyHealthRouter);
-  app.use('/health', readinessHealthRouter);
-  app.use('/api/config', configRouter);
-  app.use('/api/v1', eventsRouter);
-  app.use('/api/v1/auth', metricsService.trackAuthRequest.bind(metricsService));
-  app.use('/api/v1/auth', authRouter);
-  app.use('/api/v1/api-keys', metricsService.trackApiKeysRequest.bind(metricsService));
-  // INV-3: mounted once. `apiKeysRouter` carries a router-level rate limiter,
-  // so a second mount would charge the API-key budget twice for every request
-  // that falls through to it.
-  app.use('/api/v1', apiKeysRouter);
-  app.use('/api/v1/contracts', createContractsRouter(metricsService));
-  app.use('/api/v1/disputes', createDisputesRouter({ metricsService }));
-  app.use('/api/v1/reputation', reputationRouter);
-  app.use('/api/v1/dependency-scan', dependencyScanRouter);
-  app.use('/api/v1/admin', adminRouter);
-  app.use('/api/v1/admin/deploy', deployRouter);
-  app.use('/api/v1', rpcEventsRouter);
-  if (features.webhooksEnabled) {
-    mountRouter(app, '/api/v1/webhook-subscriptions', webhookSubscriptionRouter);
-  }
-  mountRouter(app, '/api/v1/metrics', metricsAuthMiddleware, createMetricsRouter(metricsService));
-
-  if (includeTerminalHandlers) {
-    attachTerminalHandlers(app);
-  }
-
-  // Installed after the layers above, but it registers no route: it only wraps
-  // `listen` so every server this app owns drops malformed-request sockets
-  // instead of letting Node's default handler echo a 400 back.
-  const originalListen = app.listen.bind(app);
-  (app as express.Application).listen = ((...args: Parameters<express.Application['listen']>) => {
-    const server = (originalListen as (...a: unknown[]) => import('http').Server)(...args);
-    server.on('clientError', (_err: Error, socket: import('net').Socket) => {
-      if (!socket.destroyed) socket.destroy();
-    });
-    return server;
-  }) as express.Application['listen'];
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (err instanceof HttpError) {
+      res.status(err.status).json({ error: err.code, message: err.message });
+      return;
+    }
+    if (err && typeof err === 'object' && (err as { type?: string }).type === 'entity.parse.failed') {
+      res.status(400).json({ error: 'invalid_json', message: 'Malformed JSON body' });
+      return;
+    }
+    res.status(500).json({ error: 'internal_error', message: 'Unexpected error' });
+  });
 
   return app;
 }
 
-/**
- * Releases every rate-limit store this module owns (INV-4).
- *
- * The stores exported by `config/rateLimit` each hold a sweep timer, so leaving
- * them alive keeps in-memory counters around after the server has drained. The
- * `globalThis` entry is retained as a fallback for stores wired up outside this
- * module.
- *
- * Idempotent: the first call tears down and reports, later calls return
- * immediately so repeated shutdown signals do not re-log a completed teardown.
- */
-export function shutdownRateLimitStore(): void {
-  if (rateLimitStoresReleased) return;
-  rateLimitStoresReleased = true;
-
-  const candidates: Array<[string, DestroyableStore | undefined]> = [
-    ['rate_limit_store', rateLimitStore],
-    ['api_keys_rate_limit_store', apiKeysRateLimitStore],
-    [
-      'api_keys_rate_limit_store_global',
-      (globalThis as unknown as Record<string, DestroyableStore | undefined>)[
-        'apiKeysRateLimitStore'
-      ],
-    ],
-  ];
-
-  const released: string[] = [];
-  const seen = new Set<DestroyableStore>();
-
-  for (const [name, store] of candidates) {
-    if (!store || typeof store.destroy !== 'function' || seen.has(store)) continue;
-    seen.add(store);
-    try {
-      store.destroy();
-      released.push(name);
-    } catch (error) {
-      logger.error('rate_limit_store_shutdown_failed', {
-        store: name,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
-  logger.info('rate_limit_stores_shutdown_complete', { stores: released });
-}
+export default createApp;
