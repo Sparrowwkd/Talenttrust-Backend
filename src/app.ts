@@ -5,6 +5,7 @@ import { config, explorerUrl } from './config';
 import { EscrowStore, HttpError } from './store';
 import { openapi, docsHtml } from './openapi';
 import { createLogger, type Logger, randomUUID } from './logger';
+import { ChainReader, SorobanRpcChainReader } from './chain';
 
 declare global {
   namespace Express {
@@ -18,10 +19,10 @@ const startedAt = Date.now();
 
 type LoggerLevel = 'debug' | 'info' | 'warn' | 'error';
 
-type Handler = (req: Request, res: Response) => unknown;
-const wrap = (fn: Handler) => (req: Request, res: Response, next: NextFunction) => {
+type Handler = (req: Request, res: Response) => unknown | Promise<unknown>;
+const wrap = (fn: Handler) => async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const out = fn(req, res);
+    const out = await fn(req, res);
     if (out !== undefined && !res.headersSent) res.json(out);
   } catch (err) {
     next(err);
@@ -39,24 +40,33 @@ const optionalString = (v: unknown) => (typeof v === 'string' && v.length > 0 ? 
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
 
 function resolveStoreAndLogger(
-  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore } = new EscrowStore().seed(),
-): { store: EscrowStore; logger: Logger } {
+  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
+): { store: EscrowStore; logger: Logger; chainReader: ChainReader } {
   if (
     storeOrOpts &&
     typeof storeOrOpts === 'object' &&
     'list' in storeOrOpts &&
     typeof (storeOrOpts as EscrowStore).list === 'function'
   ) {
-    return { store: storeOrOpts as EscrowStore, logger: createLogger() };
+    return { store: storeOrOpts as EscrowStore, logger: createLogger(), chainReader: new SorobanRpcChainReader() };
   }
-  const opts = (storeOrOpts as { logger?: Logger; store?: EscrowStore } | undefined) ?? {};
-  return { store: opts.store ?? new EscrowStore().seed(), logger: opts.logger ?? createLogger() };
+  const opts = (storeOrOpts as { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } | undefined) ?? {};
+  return {
+    store: opts.store ?? new EscrowStore().seed(),
+    logger: opts.logger ?? createLogger(),
+    chainReader: opts.chainReader ?? new SorobanRpcChainReader(),
+  };
 }
 
 export function createApp(
-  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore } = new EscrowStore().seed(),
+  storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
+  fallbackChainReader?: ChainReader,
 ) {
-  const { store, logger } = resolveStoreAndLogger(storeOrOpts);
+  const resolved = resolveStoreAndLogger(storeOrOpts);
+  const store = resolved.store;
+  const logger = resolved.logger;
+  const chainReader = fallbackChainReader ?? resolved.chainReader;
+
   const app = express();
   app.disable('x-powered-by');
   // Correlation id: echo a valid inbound X-Request-Id, otherwise generate one.
@@ -121,6 +131,8 @@ export function createApp(
         'POST /api/v1/contracts/:id/cancel',
         'POST /api/v1/contracts/:id/reputation',
         'POST /api/v1/contracts/:id/reviews',
+        'POST /api/v1/contracts/:id/link',
+        'GET  /api/v1/contracts/:id/parity',
         'GET  /api/v1/reputation/:address',
         'GET  /api/v1/reputation/:address/reviews',
       ],
@@ -159,12 +171,18 @@ export function createApp(
   v1.get('/stats', wrap(() => store.stats()));
   v1.get(
     '/contracts',
-    wrap((req) => ({
-      data: store.list({
-        status: typeof req.query.status === 'string' ? req.query.status : undefined,
-        party: typeof req.query.party === 'string' ? req.query.party : undefined,
-      }),
-    })),
+    wrap((req) => {
+      let linked: boolean | undefined = undefined;
+      if (req.query.linked === 'true') linked = true;
+      else if (req.query.linked === 'false') linked = false;
+      return {
+        data: store.list({
+          status: typeof req.query.status === 'string' ? req.query.status : undefined,
+          party: typeof req.query.party === 'string' ? req.query.party : undefined,
+          linked,
+        }),
+      };
+    }),
   );
   v1.post(
     '/contracts',
@@ -192,6 +210,14 @@ export function createApp(
       res.status(201).json(review);
     }),
   );
+  v1.post(
+    '/contracts/:id/link',
+    wrap(async (req) => store.linkEscrow(id(req), req.body?.escrowId, chainReader)),
+  );
+  v1.get(
+    '/contracts/:id/parity',
+    wrap(async (req) => store.checkParity(id(req), chainReader)),
+  );
   v1.get('/reputation/:address', wrap((req) => store.getReputation(req.params.address)));
   v1.get(
     '/reputation/:address/reviews',
@@ -217,7 +243,7 @@ export function createApp(
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     const requestId = req.id;
     if (err instanceof HttpError) {
-      res.status(err.status).json({ error: err.code, message: err.message, requestId });
+      res.status(err.status).json({ error: err.code, message: err.message, ...err.details, requestId });
       return;
     }
     if (err && typeof err === 'object' && (err as { type?: string }).type === 'entity.parse.failed') {
