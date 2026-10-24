@@ -39,6 +39,11 @@ const optionalString = (v: unknown) => (typeof v === 'string' && v.length > 0 ? 
 
 const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,128}$/;
 
+type StoreLike = EscrowStore & {
+  stats?: () => unknown;
+  addReview?: (contractId: number, body: unknown) => unknown;
+};
+
 function resolveStoreAndLogger(
   storeOrOpts: EscrowStore | { logger?: Logger; store?: EscrowStore; chainReader?: ChainReader } = new EscrowStore().seed(),
 ): { store: EscrowStore; logger: Logger; chainReader: ChainReader } {
@@ -63,7 +68,7 @@ export function createApp(
   fallbackChainReader?: ChainReader,
 ) {
   const resolved = resolveStoreAndLogger(storeOrOpts);
-  const store = resolved.store;
+  const store = resolved.store as StoreLike;
   const logger = resolved.logger;
   const chainReader = fallbackChainReader ?? resolved.chainReader;
 
@@ -168,7 +173,15 @@ export function createApp(
       explorer: explorerUrl(),
     })),
   );
-  v1.get('/stats', wrap(() => store.stats()));
+  v1.get(
+    '/stats',
+    wrap(() => {
+      if (typeof store.stats !== 'function') {
+        throw new HttpError(501, 'not_implemented', 'stats are not available on this store');
+      }
+      return store.stats();
+    }),
+  );
   v1.get(
     '/contracts',
     wrap((req) => {
@@ -206,6 +219,9 @@ export function createApp(
   v1.post(
     '/contracts/:id/reviews',
     wrap((req, res) => {
+      if (typeof store.addReview !== 'function') {
+        throw new HttpError(501, 'not_implemented', 'reviews are not available on this store');
+      }
       const review = store.addReview(id(req), req.body ?? {});
       res.status(201).json(review);
     }),
